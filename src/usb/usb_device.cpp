@@ -1,4 +1,4 @@
-#include "usb_device.h"
+#include "usb/usb_device.h"
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -73,24 +73,32 @@ UsbDevice::~UsbDevice() {
 bool UsbDevice::bulk_write_all(const void* data, size_t size, int timeout_ms) {
     const unsigned char* ptr = static_cast<const unsigned char*>(data);
     size_t offset = 0;
+    // Save original chunk size to restore after successful transfer
+    const size_t original_max_chunk = max_chunk_bytes;
+    size_t current_max = max_chunk_bytes;
     for (int attempt = 0; attempt < USB_RETRY_COUNT; ++attempt) {
         while (offset < size) {
             int actual_length = 0;
             size_t to_send = size - offset;
-            if (to_send > max_chunk_bytes)
-                to_send = max_chunk_bytes;
+            if (to_send > current_max)
+                to_send = current_max;
             int err = libusb_bulk_transfer(handle, endpoint_out, const_cast<unsigned char*>(ptr + offset),
                                            clamp_size_to_int(to_send), &actual_length, timeout_ms);
             if (actual_length > 0) {
                 offset += static_cast<size_t>(actual_length);
             }
             if (err != 0) {
-                if (err == LIBUSB_ERROR_NO_DEVICE)
+                // Check for device disconnect immediately
+                if (err == LIBUSB_ERROR_NO_DEVICE) {
+                    log_error("Device disconnected during bulk write");
+                    current_max = max_chunk_bytes;  // Reset on disconnect
                     return false;
+                }
                 if (err == LIBUSB_ERROR_PIPE)
                     (void) libusb_clear_halt(handle, endpoint_out);
                 if (err == LIBUSB_ERROR_PIPE || err == LIBUSB_ERROR_TIMEOUT) {
-                    max_chunk_bytes = 0x4000; // 16KB fallback
+                    // Fallback: reduce chunk size for this attempt only
+                    current_max = 0x4000;  // 16KB fallback
                 }
                 break;
             }
@@ -101,12 +109,15 @@ bool UsbDevice::bulk_write_all(const void* data, size_t size, int timeout_ms) {
             if (odin_supports_zlp && endpoint_out_max_packet != 0 && (size % endpoint_out_max_packet) == 0) {
                 send_zlp(timeout_ms);
             }
+            // Success: restore original chunk size for future transfers
+            max_chunk_bytes = original_max_chunk;
             return true;
         }
         if (attempt < USB_RETRY_COUNT - 1) {
             std::this_thread::sleep_for(std::chrono::milliseconds(retry_backoff_ms(attempt)));
         }
     }
+    // Failed but not disconnected: keep reduced chunk for next call
     return false;
 }
 
@@ -312,6 +323,10 @@ bool UsbDevice::open_device(const std::string& specific_path, const UsbSelection
     if (!target) {
         last_open_error = saw_candidate_vendor ? UsbOpenError::NotDownloadMode : UsbOpenError::NoDevice;
         log_warn("No compatible device found. Ensure the device is connected and in Download Mode.");
+        if (device_list) {
+            libusb_free_device_list(device_list, 1);
+            device_list = nullptr;
+        }
         return false;
     }
 
@@ -332,6 +347,11 @@ bool UsbDevice::open_device(const std::string& specific_path, const UsbSelection
         else
             last_open_error = UsbOpenError::Other;
         log_error("Failed to open USB device", open_err);
+        // Free device list before returning on error
+        if (device_list) {
+            libusb_free_device_list(device_list, 1);
+            device_list = nullptr;
+        }
         return false;
     }
 
@@ -343,6 +363,11 @@ bool UsbDevice::open_device(const std::string& specific_path, const UsbSelection
         log_error("Failed to claim USB interface", kernel_driver_state);
         libusb_close(handle);
         handle = nullptr;
+        // Free device list on error
+        if (device_list) {
+            libusb_free_device_list(device_list, 1);
+            device_list = nullptr;
+        }
         return false;
     }
     if (kernel_driver_state == 1) {
@@ -353,6 +378,11 @@ bool UsbDevice::open_device(const std::string& specific_path, const UsbSelection
             log_error("Failed to detach kernel driver", detach_err);
             libusb_close(handle);
             handle = nullptr;
+            // Free device list on error
+            if (device_list) {
+                libusb_free_device_list(device_list, 1);
+                device_list = nullptr;
+            }
             return false;
         }
         kernel_driver_detached = true;
@@ -372,7 +402,17 @@ bool UsbDevice::open_device(const std::string& specific_path, const UsbSelection
         }
         libusb_close(handle);
         handle = nullptr;
+        // Free device list on error
+        if (device_list) {
+            libusb_free_device_list(device_list, 1);
+            device_list = nullptr;
+        }
         return false;
+    }
+    // Success: free the device list now that we have a valid handle
+    if (device_list) {
+        libusb_free_device_list(device_list, 1);
+        device_list = nullptr;
     }
 
     std::ostringstream oss;
@@ -423,8 +463,10 @@ bool UsbDevice::receive_packet(void* data, size_t size, int* actual_length, bool
 
             if (err == LIBUSB_ERROR_PIPE)
                 (void) libusb_clear_halt(handle, endpoint_in);
-            if (err == LIBUSB_ERROR_TIMEOUT && timeout_override_ms > 0) {
-                return false;
+            if (err == LIBUSB_ERROR_TIMEOUT) {
+                if (timeout_override_ms > 0 || attempt == USB_RETRY_COUNT - 1)
+                    return false;
+                continue;
             }
             log_error("USB packet receive failed (attempt " + std::to_string(attempt + 1) + ")", err);
             if (err == LIBUSB_ERROR_NO_DEVICE)
@@ -511,15 +553,27 @@ bool UsbDevice::request_device_type() {
                   std::to_string(le16toh(response.header.packet_type)));
         return false;
     }
+
+    // Validate response size before using device_type data
+    if (actual_length < static_cast<int>(sizeof(ThorDeviceTypePacket))) {
+        log_error("Device type response too short: " + std::to_string(actual_length));
+        return false;
+    }
+
     // Copy the device type string from the response. The char array is
     // null-terminated or zero-padded. Convert to a std::string and trim
-    // trailing null bytes.
+    // trailing null bytes. Limit copy to prevent buffer overflow.
     device_type_str.clear();
-    for (int i = 0; i < static_cast<int>(sizeof(response.device_type)); ++i) {
+    const size_t max_copy = sizeof(response.device_type);
+    for (size_t i = 0; i < max_copy; ++i) {
         char c = response.device_type[i];
         if (c == '\0')
             break;
         device_type_str.push_back(c);
+    }
+    if (device_type_str.empty()) {
+        log_error("Empty device type received");
+        return false;
     }
     log_info("Device type received: " + device_type_str);
     return true;
@@ -889,9 +943,15 @@ bool UsbDevice::send_file_part_chunk(const void* data, size_t size, uint32_t chu
     return true;
 }
 
+bool UsbDevice::notify_total_bytes(uint64_t total) {
+    if (protocol_mode != ProtocolMode::OdinLegacy)
+        return true;
+    return odin_set_total_bytes(total);
+}
+
 bool UsbDevice::send_file_part_header(uint64_t total_size) {
     if (protocol_mode == ProtocolMode::OdinLegacy)
-        return odin_set_total_bytes(total_size);
+        return true;
 
     ThorFilePartSizePacket size_pkt = {};
     size_pkt.header.packet_size = h_to_le32(sizeof(ThorFilePartSizePacket));
@@ -957,6 +1017,8 @@ bool UsbDevice::send_control(uint32_t control_type) {
     if (protocol_mode == ProtocolMode::OdinLegacy) {
         if (control_type == THOR_CONTROL_REBOOT)
             return odin_reboot();
+        if (control_type == THOR_CONTROL_REDOWNLOAD)
+            log_warn("Redownload is not supported in Odin legacy mode.");
         return true;
     }
 
@@ -1193,13 +1255,13 @@ bool UsbDevice::odin_end_sequence_flash(const PitEntry& pit_entry, uint32_t real
     if (pit_entry.binary_type == 1) {
         w32(0, 0x01);
         w32(4, real_size);
-        w32(8, pit_entry.binary_type);
+        w32(8, 0u);
         w32(12, pit_entry.device_type);
         w32(16, is_last ? 1u : 0u);
     } else {
         w32(0, 0x00);
         w32(4, real_size);
-        w32(8, pit_entry.binary_type);
+        w32(8, 0u);
         w32(12, pit_entry.device_type);
         w32(16, pit_entry.identifier);
         w32(20, is_last ? 1u : 0u);
@@ -1335,6 +1397,9 @@ bool UsbDevice::flash_partition_stream(std::istream& stream, uint64_t size, cons
     uint64_t remaining = size;
     uint32_t chunk_index = 0;
 
+    uint64_t sent = 0;
+    int last_pct = -1;
+
     while (remaining > 0) {
         size_t to_read = static_cast<size_t>(std::min<uint64_t>(buf.size(), remaining));
         stream.read(reinterpret_cast<char*>(buf.data()), to_read);
@@ -1345,7 +1410,16 @@ bool UsbDevice::flash_partition_stream(std::istream& stream, uint64_t size, cons
         if (!send_file_part_chunk(buf.data(), to_read, chunk_index, large_partition))
             return false;
         remaining -= to_read;
+        sent += to_read;
         chunk_index++;
+
+        if (size > 0) {
+            int pct = static_cast<int>((sent * 100) / size);
+            if (pct != last_pct) {
+                log_info("Flashing: " + std::to_string(pct) + "%");
+                last_pct = pct;
+            }
+        }
     }
 
     return true;
