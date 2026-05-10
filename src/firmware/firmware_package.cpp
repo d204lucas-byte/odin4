@@ -12,8 +12,13 @@
 #include <lz4frame.h>
 
 #define CRYPTOPP_ENABLE_NAMESPACE_WEAK 1
+#if __has_include(<cryptopp/md5.h>)
 #include <cryptopp/md5.h>
 #include <cryptopp/hex.h>
+#else
+#include <md5.h>
+#include <hex.h>
+#endif
 
 namespace {
 struct TarMd5Info {

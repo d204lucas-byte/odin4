@@ -5,10 +5,6 @@
 #include <vector>
 #include <cstdint>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /**
  * @brief Exit codes for Odin4 operations.
  */
@@ -42,6 +38,10 @@ struct OdinConfig {
     int usb_interface = 0;
 };
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * @brief Initialize the library (e.g., logging).
  * @param cfg The configuration to use for initialization.
@@ -53,7 +53,9 @@ void odin4_init(const OdinConfig& cfg);
  * @param cfg The configuration containing USB selection criteria.
  * @return A list of device paths.
  */
+#ifdef __cplusplus
 std::vector<std::string> odin4_list_devices(const OdinConfig& cfg);
+#endif
 
 /**
  * @brief Run the flashing process or validation for a specific device.
